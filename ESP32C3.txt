@@ -1,0 +1,201 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+
+const char* WIFI_SSID     = "Oa";     
+const char* WIFI_PASSWORD = "12345678"; 
+
+const char* MQTT_SERVER   = "broker.hivemq.com";
+const int   MQTT_PORT     = 1883;
+const char* DEVICE_ID     = "pc-4821";
+
+String topicStatus = "positioncare/v1/" + String(DEVICE_ID) + "/status";
+String topicOnline = "positioncare/v1/" + String(DEVICE_ID) + "/online";
+String topicCmd    = "positioncare/v1/" + String(DEVICE_ID) + "/cmd";
+
+
+const int FSR_PIN = 2; 
+
+#define SDA_PIN 9      
+#define SCL_PIN 8
+
+byte mpuAddress = 0x68;
+bool mpuOk = false;
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+unsigned long lastPublishTime = 0;
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.println("📩 وصل أمر من الموقع!");
+}
+
+void initMPU() {
+  Wire.beginTransmission(mpuAddress);
+  Wire.write(0x6B); // PWR_MGMT_1
+  Wire.write(0x00); // إيقاظ الحساس من وضع النوم
+  if (Wire.endTransmission() == 0) {
+    mpuOk = true;
+    Serial.print("✅ تم تفعيل MPU6050 على العنوان: 0x");
+    Serial.println(mpuAddress, HEX);
+  } else {
+    mpuOk = false;
+  }
+}
+
+void connectToNetwork() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.print("جاري الاتصال بالـ Wi-Fi...");
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+    }
+    Serial.println("\n✅ تم الاتصال بالـ Wi-Fi بنجاح!");
+  }
+
+  if (!client.connected()) {
+    Serial.print("جاري الاتصال بخادم MQTT...");
+    client.setKeepAlive(60);
+    if (client.connect(DEVICE_ID, topicOnline.c_str(), 0, true, "0")) {
+      Serial.println("\n✅ تم الاتصال بخادم MQTT بنجاح!");
+      client.publish(topicOnline.c_str(), "1", true);
+      client.subscribe(topicCmd.c_str());
+    } else {
+      Serial.print(" فشل الاتصال، الكود=");
+      Serial.println(client.state());
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+  pinMode(FSR_PIN, INPUT);
+
+  Wire.begin(SDA_PIN, SCL_PIN, 100000);
+  delay(100);
+
+  mpuAddress = 0x68;
+  initMPU();
+  if (!mpuOk) {
+    mpuAddress = 0x69; 
+    initMPU();
+  }
+
+  if (!mpuOk) {
+    Serial.println("⚠️ لم يتم استجابة MPU6050، سيتم إرسال بيانات الضغط فقط.");
+  }
+
+  WiFi.setSleep(false);
+  client.setBufferSize(512); 
+  client.setServer(MQTT_SERVER, MQTT_PORT);
+  client.setCallback(callback);
+
+  connectToNetwork();
+}
+
+float getDetailedMotion(bool &isHeavy, int16_t &outX, int16_t &outY, int16_t &outZ) {
+  isHeavy = false;
+  outX = 0; outY = 0; outZ = 0;
+  if (!mpuOk) return 0.0;
+
+  Wire.beginTransmission(mpuAddress);
+  Wire.write(0x3B);
+  if (Wire.endTransmission(false) != 0) {
+    initMPU();
+    return 0.0;
+  }
+
+  if (Wire.requestFrom((uint8_t)mpuAddress, (uint8_t)6) == 6) {
+    outX = (Wire.read() << 8) | Wire.read();
+    outY = (Wire.read() << 8) | Wire.read();
+    outZ = (Wire.read() << 8) | Wire.read();
+
+    if (outX == 0 && outY == 0 && outZ == 0) {
+      return 0.0;
+    }
+
+    float gX = outX / 16384.0;
+    float gY = outY / 16384.0;
+    float gZ = outZ / 16384.0;
+
+    float totalAccel = sqrt(gX * gX + gY * gY + gZ * gZ);
+    float delta = abs(totalAccel - 1.0);
+
+    if (delta > 0.15) {
+      isHeavy = true;
+    }
+    return delta;
+  }
+  
+  return 0.0;
+}
+
+void loop() {
+  if (!client.connected()) {
+    connectToNetwork();
+  }
+  client.loop();
+
+  if (millis() - lastPublishTime >= 1000) {
+    lastPublishTime = millis();
+
+
+    int rawRead = analogRead(FSR_PIN);
+    int fsrValue = 4095 - rawRead; 
+
+    float pct = (fsrValue / 4095.0) * 100.0;
+    if (pct < 0) pct = 0;
+    int lvl = (pct >= 85) ? 3 : (pct >= 50) ? 2 : (pct >= 5) ? 1 : 0;
+
+    bool isPatientLoaded = (fsrValue > 1000); 
+
+
+    bool isHeavyMotion = false;
+    int16_t rawX = 0, rawY = 0, rawZ = 0;
+    float motionDelta = getDetailedMotion(isHeavyMotion, rawX, rawY, rawZ);
+
+
+    StaticJsonDocument<512> doc;
+    doc["v"]         = 1;
+    doc["id"]        = DEVICE_ID;
+    doc["name"]      = "Patient 01";
+    doc["room"]      = "101";
+    doc["uptime"]    = millis() / 1000;
+    doc["still"]     = isHeavyMotion ? 0 : 10;
+    doc["stable"]    = 10;
+    doc["stillReq"]  = 120;
+    doc["stableReq"] = 120;
+    doc["moving"]    = isHeavyMotion;    
+    doc["motionOk"]  = mpuOk;
+    doc["loaded"]    = isPatientLoaded;  
+    doc["alert"]     = false;
+    doc["muted"]     = false;
+    doc["alerts"]    = 0;
+
+    JsonArray zones = doc.createNestedArray("zones");
+    JsonObject sacrumZone = zones.createNestedObject();
+    sacrumZone["id"]  = "sacrum";
+    sacrumZone["pct"] = pct;
+    sacrumZone["lvl"] = lvl;
+
+    String jsonOutput;
+    serializeJson(doc, jsonOutput);
+    client.publish(topicStatus.c_str(), jsonOutput.c_str());
+    
+
+    Serial.print("📡 تم الإرسال | FSR: ");
+    Serial.print(pct, 1);
+    Serial.print("% | MPU Raw [X:");
+    Serial.print(rawX);
+    Serial.print(" Y:");
+    Serial.print(rawY);
+    Serial.print(" Z:");
+    Serial.print(rawZ);
+    Serial.print("] => Δ: ");
+    Serial.print(motionDelta, 2);
+    Serial.println(isHeavyMotion ? " 🔥 [حركة قوية!]" : " (عادي)");
+  }
+}
